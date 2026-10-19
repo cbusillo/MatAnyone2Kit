@@ -109,6 +109,34 @@ public final class MatAnyoneCoreMLEngine {
     @discardableResult
     public func step(image: Tensor) throws -> [Float] { try step(image, seedMask: nil)! }
 
+    /// One frame's encoder output, made by `encode(image:)`. It owns its
+    /// image buffer, so a later `encode` never overwrites what this frame's
+    /// mask encoder still has to read.
+    public struct Encoded: @unchecked Sendable {
+        fileprivate let image: MLFeatureValue
+        fileprivate let enc: MLFeatureProvider
+    }
+
+    /// Runs only the image encoder. It reads no tracker state, so a caller
+    /// may run `encode` for frame N+1 on one thread while `step(encoded:)`
+    /// for frame N runs on another, overlapping the encoder with the rest of
+    /// the frame. Not safe to call concurrently with itself, or while
+    /// `MatAnyoneCoreML.profilingEnabled` is on.
+    public func encode(image: Tensor) throws -> Encoded {
+        let buffer = try MatAnyoneCoreML.makeFloat16MultiArray(shape: image.shape)
+        guard image.data.count == buffer.count else {
+            throw EngineError(message: "image has \(image.data.count) values for shape \(image.shape)")
+        }
+        MatAnyoneCoreML.write(image.data, into: buffer)
+        let imageFV = MLFeatureValue(multiArray: buffer)
+        return Encoded(image: imageFV, enc: try model.run("encoder", ["image": imageFV]))
+    }
+
+    /// `step(image:)` for a frame already encoded by `encode(image:)`.
+    /// Steps must still run one at a time, in frame order.
+    @discardableResult
+    public func step(encoded: Encoded) throws -> [Float] { try step(encoded, seedMask: nil)! }
+
     /// Adds `image` with a known `mask` [H*W] to the working memory without
     /// touching the seed frame, which stays permanent. Use it after `seed`
     /// to hand the tracker a second view, for example the props alone on the
@@ -121,6 +149,12 @@ public final class MatAnyoneCoreMLEngine {
     @discardableResult
     func step(_ image: Tensor, seedMask: [Float]? = nil,
               firstFramePred: Bool = false) throws -> [Float]? {
+        try step(try encode(image: image), seedMask: seedMask, firstFramePred: firstFramePred)
+    }
+
+    @discardableResult
+    func step(_ encoded: Encoded, seedMask: [Float]? = nil,
+              firstFramePred: Bool = false) throws -> [Float]? {
         currTi += 1
         var isMemFrame = (currTi - lastMemTi >= memEvery) || (seedMask != nil)
         var needSegment = seedMask == nil
@@ -131,8 +165,8 @@ public final class MatAnyoneCoreMLEngine {
         }
 
         // --- encode (feature maps f16..f1 + pix_feat stay as MLMultiArray pass-through)
-        let imageFV = try fv(image.data, image.shape, slot: "image")   // shared with maskencoder
-        let enc = try model.run("encoder", ["image": imageFV])
+        let imageFV = encoded.image                            // shared with maskencoder
+        let enc = encoded.enc
         let pixFeat = try mv(enc, "pix_feat")
         let key = try tensor(enc, "key"), shrinkage = try tensor(enc, "shrinkage")
         let selection = try tensor(enc, "selection")
